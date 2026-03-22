@@ -1,0 +1,776 @@
+
+import 'dart:async';
+
+class AssignVisitToShift extends StatefulWidget {
+  const AssignVisitToShift({
+    super.key,
+    this.width,
+    this.height,
+    required this.visitStartTime,
+    required this.visitEndTime,
+    required this.visitDate,
+    this.shifts,
+    this.shiftsVisits,
+    required this.newVisitBuilder,
+    required this.newVisitTolerance,
+    required this.shiftVisitBuilder,
+    required this.appliedToleranceForNewVisit,
+    required this.onVisitAssigned,
+  });
+
+  final double? width;
+  final double? height;
+  final DateTime visitStartTime;
+  final DateTime visitEndTime;
+  final DateTime visitDate;
+  final List<ShiftsRow>? shifts;
+  final List<VisitsRow>? shiftsVisits;
+  final Widget Function(int visitTolerance, int appliedTolerance)
+      newVisitBuilder;
+  final int newVisitTolerance;
+  final Widget Function(VisitsRow visitData, double pixelsPerMinute)
+      shiftVisitBuilder;
+  final int appliedToleranceForNewVisit;
+  final Future Function(ShiftsRow selectedShift) onVisitAssigned;
+
+  @override
+  State<AssignVisitToShift> createState() => _AssignVisitToShiftState();
+}
+
+class _AssignVisitToShiftState extends State<AssignVisitToShift> {
+  // State variables
+  int? assignedShiftIndex;
+  // Timeline start/end (midnight to 11 PM)
+  final int startHour = 0;
+  final int endHour = 23;
+
+  DateTime currentTime = DateTime.now();
+  Timer? _timer;
+  final ScrollController _unassignedScrollController = ScrollController();
+  final Map<int, ScrollController> _shiftControllers = {};
+  bool _isSyncingScroll = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await Future.delayed(Duration(milliseconds: 100));
+      _scrollToVisitTime();
+    });
+
+    // Sync scroll between unassigned and shifts
+    _unassignedScrollController.addListener(_syncScrollFromUnassigned);
+
+    // Update current time every second
+    _timer = Timer.periodic(Duration(seconds: 1), (timer) {
+      setState(() {
+        currentTime = DateTime.now();
+      });
+    });
+  }
+
+  // Get visits for a specific shift
+  List<VisitsRow> _getVisitsForShift(String shiftId) {
+    if (widget.shiftsVisits == null) {
+      return [];
+    }
+    return widget.shiftsVisits!.where((v) => v.shiftId == shiftId).toList();
+  }
+
+  void _scrollToVisitTime() {
+    if (!_unassignedScrollController.hasClients) return;
+
+    final double maxScrollExtent =
+        _unassignedScrollController.position.maxScrollExtent;
+
+    final double visitTime =
+        widget.visitStartTime.hour + widget.visitStartTime.minute / 60.0;
+
+    final double timelineStart = startHour.toDouble();
+    final double timelineEnd = (endHour + 1).toDouble(); // inclusive end slot
+    final double timelineRange = timelineEnd - timelineStart;
+
+    final double normalized =
+        ((visitTime - timelineStart) / timelineRange).clamp(0.0, 1.0);
+
+    final double targetScrollPosition = maxScrollExtent * normalized;
+
+    _unassignedScrollController.animateTo(
+      targetScrollPosition,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeInOut,
+    );
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _unassignedScrollController.removeListener(_syncScrollFromUnassigned);
+    _unassignedScrollController.dispose();
+    for (var c in _shiftControllers.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  // Sync scroll from unassigned to all shifts
+  void _syncScrollFromUnassigned() {
+    if (_isSyncingScroll) return;
+    _isSyncingScroll = true;
+    final double offset = _unassignedScrollController.offset;
+    for (var entry in _shiftControllers.entries) {
+      final c = entry.value;
+      if (!c.hasClients) continue;
+      final max = c.position.maxScrollExtent;
+      c.jumpTo(offset.clamp(0.0, max));
+    }
+    _isSyncingScroll = false;
+  }
+
+  // Sync scroll from a shift to all others and unassigned
+  void _syncScrollFromShift(int sourceIndex) {
+    if (_isSyncingScroll) return;
+    final source = _shiftControllers[sourceIndex];
+    if (source == null || !source.hasClients) return;
+    _isSyncingScroll = true;
+    final double offset = source.offset;
+    // sync to unassigned
+    if (_unassignedScrollController.hasClients) {
+      final maxU = _unassignedScrollController.position.maxScrollExtent;
+      _unassignedScrollController.jumpTo(offset.clamp(0.0, maxU));
+    }
+    // sync other shifts
+    for (var entry in _shiftControllers.entries) {
+      if (entry.key == sourceIndex) continue;
+      final c = entry.value;
+      if (!c.hasClients) continue;
+      final max = c.position.maxScrollExtent;
+      c.jumpTo(offset.clamp(0.0, max));
+    }
+    _isSyncingScroll = false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final double width = widget.width ?? MediaQuery.of(context).size.width;
+    final int totalSlots = ((endHour - startHour + 24) % 24) + 1;
+    final double hourWidth = (width * 2) / totalSlots;
+
+    // Show empty state if no shifts
+    if (widget.shifts == null || widget.shifts!.isEmpty) {
+      return Container(
+        width: width,
+        height: 400,
+        alignment: Alignment.center,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.event_busy, size: 48, color: Color(0xff94A3B8)),
+            SizedBox(height: 16),
+            Text(
+              'No shifts available for this date',
+              style: TextStyle(
+                color: Color(0xff475569),
+                fontSize: 14,
+                fontWeight: FontWeight.w400,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return SizedBox(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Unassigned visit section
+          _buildUnassignedSection(width, hourWidth),
+          // Shifts section
+          _buildShiftsSection(width, hourWidth),
+        ],
+      ),
+    );
+  }
+
+  // Build unassigned visits section
+  Widget _buildUnassignedSection(double width, double hourWidth) {
+    final int totalSlots = ((endHour - startHour + 24) % 24) + 1;
+    final double bodyHeight = 100.0;
+    return Container(
+      color: Color(0xFFF1F5F9),
+      child: Row(
+        children: [
+          _buildUnassignedHeader(width, bodyHeight),
+          Expanded(child: _buildUnassignedBody(hourWidth, totalSlots)),
+        ],
+      ),
+    );
+  }
+
+  // Build unassigned header
+  Widget _buildUnassignedHeader(double width, double bodyHeight) {
+    final double effectiveHeight = bodyHeight > 100 ? bodyHeight : 100;
+    return Container(
+      width: width * 0.2,
+      height: effectiveHeight,
+      decoration: BoxDecoration(
+        border: Border(right: BorderSide(color: Color(0xFFE5EAF0), width: 1.0)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            Text(
+              'Current Visit',
+              style: TextStyle(
+                color: Color(0xff0F172A),
+                fontSize: 16.0,
+                fontWeight: FontWeight.w400,
+              ),
+            ),
+            SizedBox(height: 2.0),
+            Text(
+              'Click and drag to assign visit to Shift',
+              style: TextStyle(
+                color: Color(0xff475569),
+                fontSize: 12.0,
+                fontWeight: FontWeight.w400,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Build unassigned body
+  Widget _buildUnassignedBody(double hourWidth, int totalSlots) {
+    return SingleChildScrollView(
+      controller: _unassignedScrollController,
+      scrollDirection: Axis.horizontal,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header row with time slots
+          SizedBox(
+            height: 40,
+            child: Row(
+              children: List.generate(totalSlots, (index) {
+                int hour = (startHour + index) % 24;
+                return Container(
+                  width: hourWidth,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Color(0xFFE5EAF0), width: 1.0),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    _formatHour(hour),
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w500,
+                      color: Color(0xff475569),
+                    ),
+                  ),
+                );
+              }),
+            ),
+          ),
+          // Body section with visit
+          DragTarget<VisitDragData>(
+            onWillAcceptWithDetails: (details) => true,
+            onAcceptWithDetails: (details) {
+              setState(() {
+                assignedShiftIndex = null;
+              });
+            },
+            builder: (context, candidateData, rejectedData) {
+              bool isHovering = candidateData.isNotEmpty;
+              return Container(
+                height: 80,
+                width: hourWidth * totalSlots,
+                decoration: BoxDecoration(
+                  color: isHovering ? Color(0xFFE0F2FE) : Colors.transparent,
+                ),
+                child: Stack(
+                  children: [
+                    Row(
+                      children: List.generate(
+                        totalSlots,
+                        (index) => Container(width: hourWidth),
+                      ),
+                    ),
+                    // Only show visit if not assigned to a shift
+                    if (assignedShiftIndex == null)
+                      _buildDraggableVisit(hourWidth: hourWidth),
+                    _buildCurrentTimeIndicator(
+                      height: 80,
+                      hourWidth: hourWidth,
+                      totalSlots: totalSlots,
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Build shifts section
+  Widget _buildShiftsSection(double width, double hourWidth) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 350),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(widget.shifts!.length, (index) {
+            return shiftWidget(
+              shift: widget.shifts![index],
+              shiftIndex: index,
+              width: width,
+              hourWidth: hourWidth,
+            );
+          }),
+        ),
+      ),
+    );
+  }
+
+  // Build shift row widget
+  Widget shiftWidget({
+    required ShiftsRow shift,
+    required int shiftIndex,
+    required double width,
+    required double hourWidth,
+  }) {
+    final shiftVisits = _getVisitsForShift(shift.id);
+
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Color(0xFFE5EAF0), width: 1.0),
+      ),
+      child: Row(
+        children: [
+          _buildShiftHeader(shift, width, shiftVisits.length),
+          Expanded(
+            child: shiftBody(
+              shift: shift,
+              shiftIndex: shiftIndex,
+              hourWidth: hourWidth,
+              shiftVisits: shiftVisits,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Build shift header
+  Widget _buildShiftHeader(ShiftsRow shift, double width, int visitCount) {
+    return Container(
+      width: width * 0.2,
+      decoration: BoxDecoration(
+        border: Border(right: BorderSide(color: Color(0xFFE5EAF0), width: 1.0)),
+      ),
+      padding: EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            shift.shiftName ?? shift.shiftType,
+            style: TextStyle(
+              color: Color(0xff0F172A),
+              fontSize: 14.0,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          SizedBox(height: 4),
+          Text(
+            '${_formatTime(shift.startAt)} - ${_formatTime(shift.endAt)}',
+            style: TextStyle(
+              color: Color(0xff475569),
+              fontSize: 12.0,
+              fontWeight: FontWeight.w400,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget shiftBody({
+    required ShiftsRow shift,
+    required int shiftIndex,
+    required double hourWidth,
+    required List<VisitsRow> shiftVisits,
+  }) {
+    final int totalSlots = ((endHour - startHour + 24) % 24) + 1;
+    bool isAssigned = assignedShiftIndex == shiftIndex;
+
+    // Use or create a controller for this shift and sync its listener
+    final controller = _shiftControllers.putIfAbsent(shiftIndex, () {
+      final c = ScrollController();
+      c.addListener(() => _syncScrollFromShift(shiftIndex));
+      return c;
+    });
+
+    // Pre-calculate overlap check
+    double newVisitStart =
+        widget.visitStartTime.hour + widget.visitStartTime.minute / 60.0;
+    double newVisitEnd =
+        widget.visitEndTime.hour + widget.visitEndTime.minute / 60.0;
+    if (newVisitEnd <= newVisitStart) newVisitEnd += 24;
+
+    bool hasOverlap = _hasOverlapWithExistingVisits(
+      shift.id,
+      newVisitStart,
+      newVisitEnd,
+    );
+    bool isWithinShift = _isVisitWithinShiftHours(shift);
+
+    return SingleChildScrollView(
+      controller: controller,
+      scrollDirection: Axis.horizontal,
+      child: DragTarget<VisitDragData>(
+        onWillAcceptWithDetails: (details) => _canDropVisitOnShift(shift),
+        onAcceptWithDetails: (details) {
+          setState(() {
+            assignedShiftIndex = shiftIndex;
+          });
+          // Call callback when visit is assigned to shift
+          widget.onVisitAssigned.call(shift);
+        },
+        builder: (context, candidateData, rejectedData) {
+          bool isHovering = candidateData.isNotEmpty;
+          bool canAccept = isHovering && _canDropVisitOnShift(shift);
+
+          // Determine background color based on state
+          Color backgroundColor = Colors.transparent;
+          if (isHovering) {
+            if (canAccept) {
+              backgroundColor = Color(0xFFDCFCE7); // Green - can drop
+            } else if (!isWithinShift) {
+              backgroundColor = Color(0xFFFEE2E2); // Red - outside shift hours
+            } else if (hasOverlap) {
+              backgroundColor = Color(
+                0xFFFEF3C7,
+              ); // Yellow/Orange - overlap with existing visit
+            } else {
+              backgroundColor = Color(0xFFFEE2E2); // Red - other reason
+            }
+          }
+
+          return Container(
+            height: 100,
+            width: hourWidth * totalSlots,
+            decoration: BoxDecoration(color: backgroundColor),
+            child: Stack(
+              children: [
+                // Background with available/unavailable time zones
+                Row(
+                  children: List.generate(totalSlots, (index) {
+                    int hour = (startHour + index) % 24;
+                    bool isAvailable = _isHourInShift(hour, shift);
+                    return Container(
+                      width: hourWidth,
+                      decoration: BoxDecoration(
+                        color: isAvailable
+                            ? Color(0xFFDCFCE7).withValues(
+                                alpha: 0.3,
+                              ) // Light green for available
+                            : Color(0xFFE2E8F0).withValues(
+                                alpha: 0.3,
+                              ), // Gray for outside shift
+                      ),
+                    );
+                  }),
+                ),
+                // Existing visits in this shift (non-draggable)
+                ...shiftVisits.map(
+                  (visit) =>
+                      _buildShiftVisit(visit: visit, hourWidth: hourWidth),
+                ),
+                // Assigned visit (draggable) if applicable
+                if (isAssigned) _buildDraggableVisit(hourWidth: hourWidth),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  // Build a non-draggable visit that belongs to a shift
+  Widget _buildShiftVisit({
+    required VisitsRow visit,
+    required double hourWidth,
+  }) {
+    final visitStartTime = visit.scheduledStartTime;
+    final visitEndTime = visit.scheduledEndTime;
+
+    int startHourVal = visitStartTime.hour;
+    int startMinute = visitStartTime.minute;
+    int endHourVal = visitEndTime.hour;
+    int endMinute = visitEndTime.minute;
+
+    double startOffsetHours =
+        ((startHourVal - startHour + 24) % 24) + (startMinute / 60.0);
+    double endOffsetHoursRaw =
+        ((endHourVal - startHour + 24) % 24) + (endMinute / 60.0);
+    double endOffsetHours = endOffsetHoursRaw;
+
+    if (endOffsetHours <= startOffsetHours) {
+      endOffsetHours = endOffsetHoursRaw + 24;
+    }
+
+    double startPosition = startOffsetHours * hourWidth;
+    double endPosition = endOffsetHours * hourWidth;
+    double visitWidth = endPosition - startPosition;
+
+    return Positioned(
+      left: startPosition,
+      top: 10,
+      child: SizedBox(
+        width: visitWidth,
+        height: 50,
+        child: widget.shiftVisitBuilder(visit, hourWidth / 60.0),
+      ),
+    );
+  }
+
+  // Check if visit can be dropped on shift (within shift hours AND no overlap with existing visits)
+  bool _canDropVisitOnShift(ShiftsRow shift) {
+    double visitStart =
+        widget.visitStartTime.hour + widget.visitStartTime.minute / 60.0;
+    double visitEnd =
+        widget.visitEndTime.hour + widget.visitEndTime.minute / 60.0;
+    double shiftStart = shift.startAt.hour + shift.startAt.minute / 60.0;
+    double shiftEnd = shift.endAt.hour + shift.endAt.minute / 60.0;
+
+    // Handle wrap-around for overnight shifts
+    if (shiftEnd <= shiftStart) shiftEnd += 24;
+    if (visitEnd <= visitStart) visitEnd += 24;
+
+    // First check: visit must be within shift hours
+    bool isWithinShiftHours = visitStart >= shiftStart && visitEnd <= shiftEnd;
+    if (!isWithinShiftHours) return false;
+
+    // Second check: no overlap with existing visits in this shift
+    bool hasOverlap = _hasOverlapWithExistingVisits(
+      shift.id,
+      visitStart,
+      visitEnd,
+    );
+    return !hasOverlap;
+  }
+
+  // Check if new visit overlaps with any existing visits in the shift
+  // Simple logic: if times overlap, return true (cannot add visit)
+  bool _hasOverlapWithExistingVisits(
+    String shiftId,
+    double newVisitStart,
+    double newVisitEnd,
+  ) {
+    final existingVisits = _getVisitsForShift(shiftId);
+
+    for (final visit in existingVisits) {
+      double existingStart = visit.scheduledStartTime.hour +
+          visit.scheduledStartTime.minute / 60.0;
+      double existingEnd =
+          visit.scheduledEndTime.hour + visit.scheduledEndTime.minute / 60.0;
+
+      // Handle overnight visits
+      if (existingEnd <= existingStart) existingEnd += 24;
+
+      // Simple overlap check: if new visit time range intersects existing visit time range
+      if (newVisitStart < existingEnd && existingStart < newVisitEnd) {
+        return true; // Overlap found
+      }
+    }
+    return false; // No overlap
+  }
+
+  // Check if visit is within shift hours (without overlap check)
+  bool _isVisitWithinShiftHours(ShiftsRow shift) {
+    double visitStart =
+        widget.visitStartTime.hour + widget.visitStartTime.minute / 60.0;
+    double visitEnd =
+        widget.visitEndTime.hour + widget.visitEndTime.minute / 60.0;
+    double shiftStart = shift.startAt.hour + shift.startAt.minute / 60.0;
+    double shiftEnd = shift.endAt.hour + shift.endAt.minute / 60.0;
+
+    if (shiftEnd <= shiftStart) shiftEnd += 24;
+    if (visitEnd <= visitStart) visitEnd += 24;
+
+    return visitStart >= shiftStart && visitEnd <= shiftEnd;
+  }
+
+  // Check if hour is within shift
+  bool _isHourInShift(int hour, ShiftsRow shift) {
+    double hourTime = hour.toDouble();
+    double shiftStart = shift.startAt.hour + shift.startAt.minute / 60.0;
+    double shiftEnd = shift.endAt.hour + shift.endAt.minute / 60.0;
+
+    if (shiftEnd <= shiftStart) shiftEnd += 24;
+
+    return (hourTime >= shiftStart && hourTime < shiftEnd) ||
+        (hourTime + 24 >= shiftStart && hourTime + 24 < shiftEnd);
+  }
+
+  // Build the draggable visit bubble (the new visit being assigned)
+  Widget _buildDraggableVisit({required double hourWidth}) {
+    int startHourVal = widget.visitStartTime.hour;
+    int startMinute = widget.visitStartTime.minute;
+    int endHourVal = widget.visitEndTime.hour;
+    int endMinute = widget.visitEndTime.minute;
+
+    double startOffsetHours =
+        ((startHourVal - startHour + 24) % 24) + (startMinute / 60.0);
+    double endOffsetHoursRaw =
+        ((endHourVal - startHour + 24) % 24) + (endMinute / 60.0);
+    double endOffsetHours = endOffsetHoursRaw;
+
+    if (endOffsetHours <= startOffsetHours) {
+      endOffsetHours = endOffsetHoursRaw + 24;
+    }
+
+    double startPosition = startOffsetHours * hourWidth;
+    double endPosition = endOffsetHours * hourWidth;
+    double width = endPosition - startPosition;
+
+    return Positioned(
+      left: startPosition,
+      top: 10,
+      child: Draggable<VisitDragData>(
+        data: VisitDragData(widget.visitStartTime, widget.visitEndTime),
+        feedback: Material(
+          elevation: 4,
+          child: SizedBox(
+            width: width,
+            height: 50,
+            child: widget.newVisitBuilder(
+              widget.newVisitTolerance,
+              widget.appliedToleranceForNewVisit,
+            ),
+          ),
+        ),
+        childWhenDragging: SizedBox(
+          width: width,
+          height: 50,
+          child: Opacity(
+            opacity: 0.3,
+            child: widget.newVisitBuilder(
+              widget.newVisitTolerance,
+              widget.appliedToleranceForNewVisit,
+            ),
+          ),
+        ),
+        child: SizedBox(
+          width: width,
+          height: 50,
+          child: widget.newVisitBuilder(
+            widget.newVisitTolerance,
+            widget.appliedToleranceForNewVisit,
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Build current time indicator
+  Widget _buildCurrentTimeIndicator({
+    required double height,
+    required double hourWidth,
+    required int totalSlots,
+  }) {
+    // Only show indicator if today's date matches visit date
+    if (currentTime.year != widget.visitDate.year ||
+        currentTime.month != widget.visitDate.month ||
+        currentTime.day != widget.visitDate.day) {
+      return SizedBox.shrink();
+    }
+
+    int currentHour = currentTime.hour;
+    int currentMinute = currentTime.minute;
+    int currentSecond = currentTime.second;
+
+    double exactTime =
+        currentHour + currentMinute / 60.0 + currentSecond / 3600.0;
+    double offsetHours = (exactTime - startHour + 24) % 24;
+
+    if (offsetHours >= totalSlots) {
+      return SizedBox.shrink();
+    }
+
+    double position = offsetHours * hourWidth;
+
+    return Positioned(
+      left: position - 2.5,
+      top: 0,
+      child: Column(
+        children: [
+          Container(
+            width: 7,
+            height: 7,
+            decoration: BoxDecoration(
+              color: Colors.blue,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.blue.withValues(alpha: 0.5),
+                  blurRadius: 4,
+                  spreadRadius: 1,
+                ),
+              ],
+            ),
+          ),
+          Container(
+            width: 2,
+            height: height,
+            decoration: BoxDecoration(
+              color: Colors.blue,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.blue.withValues(alpha: 0.3),
+                  blurRadius: 4,
+                  spreadRadius: 1,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Format hour for timeline header
+  String _formatHour(int hour) {
+    if (hour == 0) return '12 AM';
+    if (hour < 12) return '$hour AM';
+    if (hour == 12) return '12 PM';
+    return '${hour - 12} PM';
+  }
+
+  // Format time in 12-hour format
+  String _formatTime(DateTime time) {
+    final local = time;
+    final hour = local.hour;
+    final minute = local.minute.toString().padLeft(2, '0');
+    final period = hour >= 12 ? 'PM' : 'AM';
+    final displayHour = hour > 12 ? hour - 12 : (hour == 0 ? 12 : hour);
+    return '$displayHour:$minute $period';
+  }
+}
+
+// Drag data model
+class VisitDragData {
+  final DateTime startTime;
+  final DateTime endTime;
+
+  VisitDragData(this.startTime, this.endTime);
+}
