@@ -153,7 +153,7 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
   @override
   Widget build(BuildContext context) {
     final double width = widget.width ?? MediaQuery.of(context).size.width;
-    final int totalSlots = ((endHour - startHour + 24) % 24) + 1;
+    final int totalSlots = (((endHour - startHour + 24) % 24) + 1) * 2;
     final double hourWidth = (width * 2) / totalSlots;
 
     // Show empty state if no shifts
@@ -196,10 +196,8 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
 
   // Build unassigned visits section
   Widget _buildUnassignedSection(double width, double hourWidth) {
-    final int totalSlots = ((endHour - startHour + 24) % 24) + 1;
+    final int totalSlots = (((endHour - startHour + 24) % 24) + 1) * 2;
     final double bodyHeight = 100.0;
-    return Container(
-      color: Color(0xFFF1F5F9),
       child: Row(
         children: [
           _buildUnassignedHeader(width, bodyHeight),
@@ -260,7 +258,6 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
             height: 40,
             child: Row(
               children: List.generate(totalSlots, (index) {
-                int hour = (startHour + index) % 24;
                 return Container(
                   width: hourWidth,
                   decoration: BoxDecoration(
@@ -268,7 +265,7 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
                   ),
                   alignment: Alignment.center,
                   child: Text(
-                    _formatHour(hour),
+                    _formatSlot(index),
                     style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.w500,
@@ -409,10 +406,8 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
     required double hourWidth,
     required List<VisitsRow> shiftVisits,
   }) {
-    final int totalSlots = ((endHour - startHour + 24) % 24) + 1;
-    bool isAssigned = assignedShiftIndex == shiftIndex;
-
-    // Use or create a controller for this shift and sync its listener
+    final int totalSlots = (((endHour - startHour + 24) % 24) + 1) * 2;
+    bool isAssigned = assignedShiftIndex == shiftIndex;and sync its listener
     final controller = _shiftControllers.putIfAbsent(shiftIndex, () {
       final c = ScrollController();
       c.addListener(() => _syncScrollFromShift(shiftIndex));
@@ -474,8 +469,8 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
                 // Background with available/unavailable time zones
                 Row(
                   children: List.generate(totalSlots, (index) {
-                    int hour = (startHour + index) % 24;
-                    bool isAvailable = _isHourInShift(hour, shift);
+                    double slotTime = startHour + index * 0.5;
+                    bool isAvailable = _isSlotInShift(slotTime, shift);
                     return Container(
                       width: hourWidth,
                       decoration: BoxDecoration(
@@ -528,8 +523,8 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
       endOffsetHours = endOffsetHoursRaw + 24;
     }
 
-    double startPosition = startOffsetHours * hourWidth;
-    double endPosition = endOffsetHours * hourWidth;
+    double startPosition = startOffsetHours * hourWidth * 2;
+    double endPosition = endOffsetHours * hourWidth * 2;
     double visitWidth = endPosition - startPosition;
 
     return Positioned(
@@ -538,7 +533,7 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
       child: SizedBox(
         width: visitWidth,
         height: 50,
-        child: widget.shiftVisitBuilder(visit, hourWidth / 60.0),
+        child: widget.shiftVisitBuilder(visit, hourWidth * 2 / 60.0),
       ),
     );
   }
@@ -622,6 +617,17 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
         (hourTime + 24 >= shiftStart && hourTime + 24 < shiftEnd);
   }
 
+  // Check if a 30-minute slot time (in fractional hours) is within shift hours
+  bool _isSlotInShift(double slotTime, ShiftsRow shift) {
+    double shiftStart = shift.startAt.hour + shift.startAt.minute / 60.0;
+    double shiftEnd = shift.endAt.hour + shift.endAt.minute / 60.0;
+
+    if (shiftEnd <= shiftStart) shiftEnd += 24;
+
+    return (slotTime >= shiftStart && slotTime < shiftEnd) ||
+        (slotTime + 24 >= shiftStart && slotTime + 24 < shiftEnd);
+  }
+
   // Build the draggable visit bubble (the new visit being assigned)
   Widget _buildDraggableVisit({required double hourWidth}) {
     int startHourVal = widget.visitStartTime.hour;
@@ -639,8 +645,8 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
       endOffsetHours = endOffsetHoursRaw + 24;
     }
 
-    double startPosition = startOffsetHours * hourWidth;
-    double endPosition = endOffsetHours * hourWidth;
+    double startPosition = startOffsetHours * hourWidth * 2;
+    double endPosition = endOffsetHours * hourWidth * 2;
     double width = endPosition - startPosition;
 
     return Positioned(
@@ -703,11 +709,11 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
         currentHour + currentMinute / 60.0 + currentSecond / 3600.0;
     double offsetHours = (exactTime - startHour + 24) % 24;
 
-    if (offsetHours >= totalSlots) {
+    if (offsetHours >= totalSlots / 2.0) {
       return SizedBox.shrink();
     }
 
-    double position = offsetHours * hourWidth;
+    double position = offsetHours * hourWidth * 2;
 
     return Positioned(
       left: position - 2.5,
@@ -754,6 +760,20 @@ class _AssignVisitToShiftState extends State<AssignVisitToShift> {
     if (hour < 12) return '$hour AM';
     if (hour == 12) return '12 PM';
     return '${hour - 12} PM';
+  }
+
+  // Format 30-minute slot label for timeline header
+  // slotIndex 0 = "12 AM", 1 = "12:30 AM", 2 = "1 AM", 3 = "1:30 AM", etc.
+  String _formatSlot(int slotIndex) {
+    final int totalMinutes = startHour * 60 + slotIndex * 30;
+    final int hour = totalMinutes ~/ 60;
+    final int minute = totalMinutes % 60;
+    final String minuteSuffix = minute == 0 ? '' : ':30';
+    if (hour == 0 && minute == 0) return '12 AM';
+    if (hour == 0) return '12:30 AM';
+    if (hour < 12) return '$hour$minuteSuffix AM';
+    if (hour == 12) return '12$minuteSuffix PM';
+    return '${hour - 12}$minuteSuffix PM';
   }
 
   // Format time in 12-hour format
